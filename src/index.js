@@ -8,13 +8,15 @@ const crypto = require('crypto');
 const server = express();
 const PORT = process.env.PORT || 8080;
 
-const CACHE_PATH = '/usr/src/app/.caches';
+
+const CACHE_PATH = '/tmp/.caches';
 const PART_PREFIX = '/tmp/.cache_';
 const PART_EXT = '.part';
 const PART_META_EXT = '.meta';
+const AUTH_KEY = process.env.AUTH_KEY || 'foo';
 
 // DB Setup
-const db = new sqlite3('/usr/local/etc/cache.db');
+const db = new sqlite3('cache.db'); // /usr/local/etc/cache.db');
 try {
     db.prepare("" +
         "CREATE TABLE caches (" +
@@ -41,7 +43,7 @@ const unless = (re_paths, middleware) => {
 };
 
 const authmiddleware = (req, res, next) => {
-    if (req.get('Authorization') !== `Bearer ${process.env.AUTH_KEY}`) {
+    if (req.get('Authorization') !== `Bearer ${AUTH_KEY}`) {
         res.status(401).json({message: 'You are not authorized'});
     } else {
         next();
@@ -82,7 +84,11 @@ server.use(bodyParser.json());
 server.use(bodyParser.raw({
     type: 'application/octet-stream',
     limit: '500mb'
-}))
+}));
+server.use((req, res, next) => {
+    console.log({ method: req.method, url: req.originalUrl, headers: req.headers, body: req.body });
+    next();
+});
 
 server.use(unless([
     /^\/_apis\/artifactcache\/artifacts\/\d+$/], authmiddleware));
@@ -145,8 +151,8 @@ function getMatchingPrimaryKey(primaryKey, version, restorePaths=[], exactMatch 
 //          1.2.2 - If there aren't `restorePaths` prefixes remaining
 //              1.2.2.1 - return a CACHE MISS 204 code
 //
-server.get('/_apis/artifactcache/cache', (req, res) => {
-    const keyList = req.query.keys.split(',');
+ const cachefn = (req, res) => {
+    const keyList = req.query.keys ? req.query.keys.split(',') : [ req.body.Name ];
     const primaryKey = keyList[0]
     const restorePaths = keyList.slice(1);
     const version = req.query.version;
@@ -176,12 +182,15 @@ server.get('/_apis/artifactcache/cache', (req, res) => {
             res.status(200).json({result: 'hit', archiveLocation: cacheFileURL, cacheKey: foundPrimaryKey});
         }
     }
-});
+};
+
+server.get('/_apis/artifactcache/cache', cachefn);
+server.get('/_apis/pipelines/workflows/:id/artifacts', cachefn);
 
 // Reserve a cache for an upcoming upload
-server.post('/_apis/artifactcache/caches', (req, res) => {
-    const key = req.body.key
-    const version = req.body.version
+const cachespostfn = (req, res) => {
+    const key = req.body.key || req.body.Name; // || Math.random().toString(36).substring(7);
+    const version = req.body.version || '1.0';
 
     console.log(`Request to reserve cache ${key} for uploading`);
     const row = db.prepare("SELECT * FROM caches WHERE key = ? AND version = ?").get(key, version);
@@ -196,15 +205,18 @@ server.post('/_apis/artifactcache/caches', (req, res) => {
             res.status(400).json({error: err});
         } else {
             console.log(`Cache id ${row.id} already reserved, but did not start uploading`);
-            res.status(200).json({cacheId: row.id});
+            res.status(200).json({cacheId: row.id, fileContainerResourceUrl: `http://localhost:8080/_apis/artifactcache/caches/${row.id}`});
         }
     }
     else
     {
         const id = db.prepare("INSERT INTO caches (key, version) VALUES (?, ?)").run(key, version).lastInsertRowid;
-        res.status(200).json({cacheId: id});
+        res.status(200).json({cacheId: id, fileContainerResourceUrl: `http://localhost:8080/_apis/artifactcache/caches/${id}`});
     }
-});
+};
+
+server.post('/_apis/artifactcache/caches', cachespostfn);
+server.post('/_apis/pipelines/workflows/:id/artifacts', cachespostfn);
 
 function writePartFile (id, body, contentRange) {
     const file = getPartFile(id, contentRange);
@@ -213,18 +225,22 @@ function writePartFile (id, body, contentRange) {
     console.log(`Writing range ${contentRange} to ${metaFile}`);
     fs.writeFileSync(`${path.normalize(metaFile)}`, contentRange, {encoding: 'utf-8'});
     console.log(`Write file part to ${file}`);
-    fs.writeFileSync(`${path.normalize(file)}`, body);
+    fs.writeFileSync(`${path.normalize(file)}`, typeof body === 'object' ? JSON.stringify(body) : body, {encoding: 'binary'});
+}
+
+function getPartPath(cacheId) {
+    const tmpPartPaths = path.join(CACHE_PATH, `${PART_PREFIX}${cacheId}`);
+    !fs.existsSync(tmpPartPaths) && fs.mkdirSync(tmpPartPaths, { recursive: true });
+    return tmpPartPaths;
 }
 
 function getPartFile (cacheId, contentRange) {
-    const tmpPartPaths = `${PART_PREFIX}${cacheId}`;
-    !fs.existsSync(tmpPartPaths) && fs.mkdirSync(tmpPartPaths, { recursive: true });
     const fileName = crypto.createHash('sha256').update(contentRange).digest('hex');
-    return path.join(tmpPartPaths, `${fileName}${PART_EXT}`);
+    return path.join(getPartPath(cacheId), `${fileName}${PART_EXT}`);
 }
 
 function getOrderedPartFiles (cacheId) {
-    const tmpPartPaths = `${PART_PREFIX}${cacheId}`;
+    const tmpPartPaths = getPartPath(cacheId);
     if (!fs.existsSync(tmpPartPaths)) {
         return null;
     } else {
@@ -254,11 +270,12 @@ function getOrderedPartFiles (cacheId) {
 }
 
 // Upload cache file parts with a cache id
-server.patch('/_apis/artifactcache/caches/:cacheId', (req, res) => {
+const patchfn = (req, res) => {
     console.log('Upload request');
     const {cacheId} = req.params;
+    const {artifactName} = req.query;
 
-    const row = db.prepare("SELECT * FROM caches WHERE id = ?").get(cacheId);
+    const row = db.prepare("SELECT * FROM caches WHERE id = ? or key = ?").get(cacheId, artifactName);
     if (row === undefined) {
         const err = `Cache with id ${cacheId} has not been reserved`;
         console.error(err);
@@ -273,11 +290,15 @@ server.patch('/_apis/artifactcache/caches/:cacheId', (req, res) => {
             console.log(`Upload for cache id ${row.id} started`)
             db.prepare("UPDATE caches SET started = 1 WHERE id = ?").run(row.id);
         }
-        const contentRange = req.header('Content-Range');
+        const contentRange = req.header('Content-Range') || req.body.Size.toString();
         writePartFile(row.id, req.body, contentRange);
         res.status(200).json({});
     }
-});
+};
+
+server.patch('/_apis/artifactcache/caches/:cacheId', patchfn);
+server.patch('/_apis/pipelines/workflows/:workflowId/artifacts', patchfn);
+server.put('/_apis/artifactcache/caches/:cacheId', patchfn);
 
 // Commit the cache parts upload
 server.post('/_apis/artifactcache/caches/:cacheId', (req, res) => {
@@ -318,7 +339,7 @@ server.post('/_apis/artifactcache/caches/:cacheId', (req, res) => {
                     res.status(200).json({});
                     db.prepare("UPDATE caches SET complete = 1 WHERE id = ?").run(row.id);
                 }
-                const tmpPartPaths = `${PART_PREFIX}${cacheId}`;
+                const tmpPartPaths = getPartPath(cacheId);
                 fs.rmSync(tmpPartPaths, {recursive: true, force: true});
             });
         }
@@ -342,8 +363,8 @@ server.post('/_apis/artifactcache/clean', (req, res) => {
     res.status(200).json({});
 });
 
-server.listen(PORT, () => {
-    console.log(`Listening on port ${PORT}`);
+const s = server.listen(PORT, () => {
+    console.log(`running at http://0.0.0.0:${PORT}/`, `with auth key ${AUTH_KEY}`);
 })
 
 process.on('SIGTERM', () => {
